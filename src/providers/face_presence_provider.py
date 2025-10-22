@@ -223,7 +223,6 @@ class FacePresenceProvider:
             except Exception:
                 pass
 
-
     def _fetch_snapshot(self, recent_sec: Optional[float] = None) -> PresenceSnapshot:
         """
         POST `/who` with a lookback window (default: self.recent_sec) and build a
@@ -237,7 +236,9 @@ class FacePresenceProvider:
 
         if self.prefer_recent:
             rc: Dict[str, int] = data.get("recent_counts", {}) or {}
-            names = [k for k, c in rc.items() if k and k != "unknown" and int(c or 0) > 0]
+            names = [
+                k for k, c in rc.items() if k and k != "unknown" and int(c or 0) > 0
+            ]
             unknown = int(data.get("unknown_recent", 0) or 0)
         else:
             now = data.get("now", []) or []
