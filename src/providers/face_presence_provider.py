@@ -11,7 +11,7 @@ from .singleton import singleton
 @dataclass
 class PresenceSnapshot:
     """
-    Canonical record returned by `/who`.
+    Canonical record returned by `/who`
 
     Attributes
     ----------
