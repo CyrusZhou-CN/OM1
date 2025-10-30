@@ -1,3 +1,6 @@
+import asyncio
+import os
+import tempfile
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -87,7 +90,7 @@ def cortex_runtime(mock_system_config):
         mock_sleep_provider.skip_sleep = False
         mock_sleep_provider_class.return_value = mock_sleep_provider
 
-        runtime = ModeCortexRuntime(mock_system_config)
+        runtime = ModeCortexRuntime(mock_system_config, "test_config")
         runtime.mode_manager = mock_manager
         runtime.io_provider = mock_io_provider
         runtime.sleep_ticker_provider = mock_sleep_provider
@@ -113,9 +116,10 @@ class TestModeCortexRuntime:
             mock_manager.add_transition_callback = Mock()
             mock_manager_class.return_value = mock_manager
 
-            runtime = ModeCortexRuntime(mock_system_config)
+            runtime = ModeCortexRuntime(mock_system_config, "test_config")
 
             assert runtime.mode_config == mock_system_config
+            assert runtime.mode_config_name == "test_config"
             assert runtime.current_config is None
             assert runtime.fuser is None
             assert runtime.action_orchestrator is None
@@ -312,3 +316,370 @@ class TestModeCortexRuntime:
             mock_task1.cancel.assert_called_once()
             mock_task2.cancel.assert_called_once()
             mock_gather.assert_called_once()
+
+
+class TestModeCortexRuntimeHotReload:
+    """Test cases for hot reload functionality in ModeCortexRuntime."""
+
+    @pytest.fixture
+    def temp_config_file(self):
+        """Create a temporary config file for testing hot reload."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json5", delete=False) as f:
+            f.write('{"test": "config"}')
+            temp_path = f.name
+
+        yield temp_path
+
+        # Cleanup
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+    def test_hot_reload_initialization_enabled(self, mock_system_config):
+        """Test hot reload initialization when enabled."""
+        with (
+            patch("runtime.multi_mode.cortex.ModeManager") as mock_manager_class,
+            patch("runtime.multi_mode.cortex.IOProvider"),
+            patch("runtime.multi_mode.cortex.SleepTickerProvider"),
+            patch("os.path.exists", return_value=True),
+            patch("os.path.getmtime", return_value=1234567890.0),
+        ):
+            mock_manager = Mock()
+            mock_manager.add_transition_callback = Mock()
+            mock_manager_class.return_value = mock_manager
+
+            runtime = ModeCortexRuntime(
+                mock_system_config, "test_config", hot_reload=True, check_interval=30
+            )
+
+            assert runtime.hot_reload is True
+            assert runtime.check_interval == 30
+            assert runtime.last_modified == 1234567890.0
+            assert runtime.config_path.endswith("test_config.json5")
+
+    def test_hot_reload_initialization_disabled(self, mock_system_config):
+        """Test hot reload initialization when disabled."""
+        with (
+            patch("runtime.multi_mode.cortex.ModeManager") as mock_manager_class,
+            patch("runtime.multi_mode.cortex.IOProvider"),
+            patch("runtime.multi_mode.cortex.SleepTickerProvider"),
+        ):
+            mock_manager = Mock()
+            mock_manager.add_transition_callback = Mock()
+            mock_manager_class.return_value = mock_manager
+
+            runtime = ModeCortexRuntime(
+                mock_system_config, "test_config", hot_reload=False
+            )
+
+            assert runtime.hot_reload is False
+            assert runtime.last_modified is None
+
+    def test_get_file_mtime_existing_file(self, mock_system_config, temp_config_file):
+        """Test getting modification time of existing file."""
+        with (
+            patch("runtime.multi_mode.cortex.ModeManager") as mock_manager_class,
+            patch("runtime.multi_mode.cortex.IOProvider"),
+            patch("runtime.multi_mode.cortex.SleepTickerProvider"),
+        ):
+            mock_manager = Mock()
+            mock_manager.add_transition_callback = Mock()
+            mock_manager_class.return_value = mock_manager
+
+            runtime = ModeCortexRuntime(
+                mock_system_config, "test_config", hot_reload=True
+            )
+            runtime.config_path = temp_config_file
+
+            mtime = runtime._get_file_mtime()
+            assert mtime > 0
+
+    def test_get_file_mtime_nonexistent_file(self, mock_system_config):
+        """Test getting modification time of non-existent file."""
+        with (
+            patch("runtime.multi_mode.cortex.ModeManager") as mock_manager_class,
+            patch("runtime.multi_mode.cortex.IOProvider"),
+            patch("runtime.multi_mode.cortex.SleepTickerProvider"),
+        ):
+            mock_manager = Mock()
+            mock_manager.add_transition_callback = Mock()
+            mock_manager_class.return_value = mock_manager
+
+            runtime = ModeCortexRuntime(
+                mock_system_config, "test_config", hot_reload=True
+            )
+            runtime.config_path = "/nonexistent/file.json5"
+
+            mtime = runtime._get_file_mtime()
+            assert mtime == 0.0
+
+    @pytest.mark.asyncio
+    async def test_check_config_changes_file_changed(
+        self, mock_system_config, temp_config_file
+    ):
+        """Test config change detection when file is modified."""
+        with (
+            patch("runtime.multi_mode.cortex.ModeManager") as mock_manager_class,
+            patch("runtime.multi_mode.cortex.IOProvider"),
+            patch("runtime.multi_mode.cortex.SleepTickerProvider"),
+        ):
+            mock_manager = Mock()
+            mock_manager.add_transition_callback = Mock()
+            mock_manager_class.return_value = mock_manager
+
+            runtime = ModeCortexRuntime(
+                mock_system_config, "test_config", hot_reload=True, check_interval=0.1
+            )
+            runtime.config_path = temp_config_file
+            runtime.last_modified = 1.0
+
+            runtime._reload_config = AsyncMock()
+
+            task = asyncio.create_task(runtime._check_config_changes())
+
+            try:
+                await asyncio.sleep(0.2)
+                task.cancel()
+
+                runtime._reload_config.assert_called_once()
+            except asyncio.CancelledError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_check_config_changes_no_change(self, mock_system_config):
+        """Test config change detection when file is not modified."""
+        with (
+            patch("runtime.multi_mode.cortex.ModeManager") as mock_manager_class,
+            patch("runtime.multi_mode.cortex.IOProvider"),
+            patch("runtime.multi_mode.cortex.SleepTickerProvider"),
+            patch("os.path.exists", return_value=True),
+            patch("os.path.getmtime", return_value=1234567890.0),
+        ):
+            mock_manager = Mock()
+            mock_manager.add_transition_callback = Mock()
+            mock_manager_class.return_value = mock_manager
+
+            runtime = ModeCortexRuntime(
+                mock_system_config, "test_config", hot_reload=True, check_interval=0.1
+            )
+            runtime.last_modified = 1234567890.0
+
+            runtime._reload_config = AsyncMock()
+
+            task = asyncio.create_task(runtime._check_config_changes())
+
+            try:
+                await asyncio.sleep(0.2)
+                task.cancel()
+
+                runtime._reload_config.assert_not_called()
+            except asyncio.CancelledError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_check_config_changes_nonexistent_file(self, mock_system_config):
+        """Test config change detection with non-existent file."""
+        with (
+            patch("runtime.multi_mode.cortex.ModeManager") as mock_manager_class,
+            patch("runtime.multi_mode.cortex.IOProvider"),
+            patch("runtime.multi_mode.cortex.SleepTickerProvider"),
+        ):
+            mock_manager = Mock()
+            mock_manager.add_transition_callback = Mock()
+            mock_manager_class.return_value = mock_manager
+
+            runtime = ModeCortexRuntime(
+                mock_system_config, "test_config", hot_reload=True, check_interval=0.1
+            )
+            runtime.config_path = "/nonexistent/file.json5"
+            runtime.last_modified = 1.0
+
+            runtime._reload_config = AsyncMock()
+
+            task = asyncio.create_task(runtime._check_config_changes())
+
+            try:
+                await asyncio.sleep(0.2)
+                task.cancel()
+
+                runtime._reload_config.assert_not_called()
+            except asyncio.CancelledError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_reload_config_success(self, mock_system_config):
+        """Test successful config reload."""
+        with (
+            patch("runtime.multi_mode.cortex.ModeManager") as mock_manager_class,
+            patch("runtime.multi_mode.cortex.IOProvider"),
+            patch("runtime.multi_mode.cortex.SleepTickerProvider"),
+            patch("runtime.multi_mode.cortex.load_mode_config") as mock_load_config,
+        ):
+            mock_manager = Mock()
+            mock_manager.add_transition_callback = Mock()
+            mock_manager.current_mode_name = "test_mode"
+            mock_manager.state = Mock()
+            mock_manager.state.transition_history = []
+            mock_manager_class.return_value = mock_manager
+
+            new_mock_config = Mock(spec=ModeSystemConfig)
+            new_mock_config.default_mode = "test_mode"
+            new_mock_config.modes = {"test_mode": Mock()}
+            mock_load_config.return_value = new_mock_config
+
+            runtime = ModeCortexRuntime(
+                mock_system_config, "test_config", hot_reload=True
+            )
+            runtime.mode_manager = mock_manager
+
+            runtime._stop_current_orchestrators = AsyncMock()
+            runtime._initialize_mode = AsyncMock()
+            runtime._start_orchestrators = AsyncMock()
+
+            await runtime._reload_config()
+
+            mock_load_config.assert_called_once_with("test_config")
+            runtime._stop_current_orchestrators.assert_called_once()
+            runtime._initialize_mode.assert_called_once_with("test_mode")
+            runtime._start_orchestrators.assert_called_once()
+
+            assert runtime.mode_config == new_mock_config
+            assert runtime.mode_manager.config == new_mock_config
+
+    @pytest.mark.asyncio
+    async def test_reload_config_mode_not_found(self, mock_system_config):
+        """Test config reload when current mode is not in new config."""
+        with (
+            patch("runtime.multi_mode.cortex.ModeManager") as mock_manager_class,
+            patch("runtime.multi_mode.cortex.IOProvider"),
+            patch("runtime.multi_mode.cortex.SleepTickerProvider"),
+            patch("runtime.multi_mode.cortex.load_mode_config") as mock_load_config,
+        ):
+            mock_manager = Mock()
+            mock_manager.add_transition_callback = Mock()
+            mock_manager.current_mode_name = "old_mode"
+            mock_manager.state = Mock()
+            mock_manager.state.transition_history = []
+            mock_manager_class.return_value = mock_manager
+
+            new_mock_config = Mock(spec=ModeSystemConfig)
+            new_mock_config.default_mode = "default_mode"
+            new_mock_config.modes = {"default_mode": Mock()}
+            mock_load_config.return_value = new_mock_config
+
+            runtime = ModeCortexRuntime(
+                mock_system_config, "test_config", hot_reload=True
+            )
+            runtime.mode_manager = mock_manager
+
+            runtime._stop_current_orchestrators = AsyncMock()
+            runtime._initialize_mode = AsyncMock()
+            runtime._start_orchestrators = AsyncMock()
+
+            await runtime._reload_config()
+
+            runtime._initialize_mode.assert_called_once_with("default_mode")
+            assert runtime.mode_manager.state.current_mode == "default_mode"
+
+    @pytest.mark.asyncio
+    async def test_reload_config_failure(self, mock_system_config):
+        """Test config reload failure handling."""
+        with (
+            patch("runtime.multi_mode.cortex.ModeManager") as mock_manager_class,
+            patch("runtime.multi_mode.cortex.IOProvider"),
+            patch("runtime.multi_mode.cortex.SleepTickerProvider"),
+            patch(
+                "runtime.multi_mode.cortex.load_mode_config",
+                side_effect=Exception("Load failed"),
+            ),
+        ):
+            mock_manager = Mock()
+            mock_manager.add_transition_callback = Mock()
+            mock_manager_class.return_value = mock_manager
+
+            runtime = ModeCortexRuntime(
+                mock_system_config, "test_config", hot_reload=True
+            )
+            runtime.mode_manager = mock_manager
+
+            runtime._stop_current_orchestrators = AsyncMock()
+
+            await runtime._reload_config()
+
+            runtime._stop_current_orchestrators.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_with_hot_reload_enabled(self, mock_system_config):
+        """Test run method with hot reload enabled."""
+        with (
+            patch("runtime.multi_mode.cortex.ModeManager") as mock_manager_class,
+            patch("runtime.multi_mode.cortex.IOProvider"),
+            patch("runtime.multi_mode.cortex.SleepTickerProvider"),
+        ):
+            mock_manager = Mock()
+            mock_manager.add_transition_callback = Mock()
+            mock_manager.current_mode_name = "test_mode"
+            mock_manager.set_event_loop = Mock()
+            mock_manager_class.return_value = mock_manager
+
+            mock_system_config.execute_global_lifecycle_hooks = AsyncMock(
+                return_value=True
+            )
+            mock_system_config.modes = {"test_mode": Mock()}
+            mock_system_config.modes["test_mode"].execute_lifecycle_hooks = AsyncMock()
+
+            runtime = ModeCortexRuntime(
+                mock_system_config, "test_config", hot_reload=True, check_interval=1
+            )
+            runtime.mode_manager = mock_manager
+            runtime.config_path = "/fake/path/test_config.json5"
+
+            runtime._initialize_mode = AsyncMock()
+            runtime._start_orchestrators = AsyncMock()
+            runtime._cleanup_tasks = AsyncMock()
+
+            async def mock_cortex_loop():
+                await asyncio.sleep(0.01)
+                return
+
+            async def mock_config_watcher():
+                await asyncio.sleep(0.01)
+                return
+
+            runtime._run_cortex_loop = AsyncMock(side_effect=mock_cortex_loop)
+            runtime._check_config_changes = AsyncMock(side_effect=mock_config_watcher)
+
+            try:
+                await asyncio.wait_for(runtime.run(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+
+            assert runtime.config_watcher_task is not None
+            runtime._check_config_changes.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_tasks_with_config_watcher(self, mock_system_config):
+        """Test cleanup includes config watcher task when hot reload is enabled."""
+        with (
+            patch("runtime.multi_mode.cortex.ModeManager") as mock_manager_class,
+            patch("runtime.multi_mode.cortex.IOProvider"),
+            patch("runtime.multi_mode.cortex.SleepTickerProvider"),
+        ):
+            mock_manager = Mock()
+            mock_manager.add_transition_callback = Mock()
+            mock_manager_class.return_value = mock_manager
+
+            runtime = ModeCortexRuntime(
+                mock_system_config, "test_config", hot_reload=True
+            )
+            runtime.mode_manager = mock_manager
+
+            mock_config_watcher = Mock()
+            mock_config_watcher.done.return_value = False
+            mock_config_watcher.cancel = Mock()
+            runtime.config_watcher_task = mock_config_watcher
+
+            with patch("asyncio.gather", new_callable=AsyncMock) as mock_gather:
+                await runtime._cleanup_tasks()
+
+                mock_config_watcher.cancel.assert_called_once()
+                mock_gather.assert_called_once()
