@@ -174,6 +174,8 @@ class ModeCortexRuntime:
         """
         logging.debug("Stopping current orchestrators...")
 
+        self.sleep_ticker_provider.skip_sleep = True
+
         tasks_to_cancel = {}
 
         if self.cortex_loop_task and not self.cortex_loop_task.done():
@@ -270,6 +272,9 @@ class ModeCortexRuntime:
         if self.background_orchestrator:
             self.background_task = self.background_orchestrator.start()
 
+        # Start main cortex
+        self.cortex_loop_task = asyncio.create_task(self._run_cortex_loop())
+
         logging.debug("Orchestrators started successfully")
 
     async def _cleanup_tasks(self):
@@ -345,13 +350,11 @@ class ModeCortexRuntime:
                     self._check_config_changes()
                 )
 
-            self.cortex_loop_task = asyncio.create_task(self._run_cortex_loop())
-
             while True:
                 try:
-                    awaitables: List[Union[asyncio.Task, asyncio.Future]] = [
-                        self.cortex_loop_task
-                    ]
+                    awaitables: List[Union[asyncio.Task, asyncio.Future]] = []
+                    if self.cortex_loop_task and not self.cortex_loop_task.done():
+                        awaitables.append(self.cortex_loop_task)
                     if self.config_watcher_task and not self.config_watcher_task.done():
                         awaitables.append(self.config_watcher_task)
                     if self.input_listener_task and not self.input_listener_task.done():
@@ -371,11 +374,6 @@ class ModeCortexRuntime:
                     )
 
                     await asyncio.sleep(0.1)
-
-                    if not self.cortex_loop_task.done():
-                        continue
-                    else:
-                        break
 
                 except Exception as e:
                     logging.error(f"Error in orchestrator tasks: {e}")
@@ -415,6 +413,10 @@ class ModeCortexRuntime:
         try:
             while True:
                 try:
+                    logging.info("------ Cortex Info -------")
+                    logging.info(f"hertz {self.current_config.hertz}")
+                    logging.info("--------------------------")
+
                     if (
                         not self.sleep_ticker_provider.skip_sleep
                         and self.current_config
@@ -587,8 +589,6 @@ class ModeCortexRuntime:
             await self._initialize_mode(current_mode)
 
             await self._start_orchestrators()
-
-            self.cortex_loop_task = asyncio.create_task(self._run_cortex_loop())
 
             logging.info(
                 f"Mode configuration reloaded successfully, active mode: {current_mode}"
