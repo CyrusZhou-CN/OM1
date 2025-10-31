@@ -413,10 +413,6 @@ class ModeCortexRuntime:
         try:
             while True:
                 try:
-                    logging.info("------ Cortex Info -------")
-                    logging.info(f"hertz {self.current_config.hertz}")
-                    logging.info("--------------------------")
-
                     if (
                         not self.sleep_ticker_provider.skip_sleep
                         and self.current_config
