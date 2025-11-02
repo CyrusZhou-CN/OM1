@@ -74,14 +74,10 @@ class ModeCortexRuntime:
 
         # Initialize hot-reload if enabled
         if self.hot_reload:
-            self.config_path = os.path.join(
-                os.path.dirname(__file__),
-                "../../../config",
-                self.mode_config_name + ".json5",
-            )
+            self.config_path = self.mode_manager._get_runtime_config_path()
             self.last_modified = self._get_file_mtime()
             logging.info(
-                f"Hot-reload enabled for mode config: {self.config_path} (check interval: {check_interval}s)"
+                f"Hot-reload enabled for runtime config: {self.config_path} (check interval: {check_interval}s)"
             )
 
         # Current runtime components
@@ -285,16 +281,14 @@ class ModeCortexRuntime:
 
         if self.config_watcher_task and not self.config_watcher_task.done():
             tasks_to_cancel.append(self.config_watcher_task)
-
+        if self.cortex_loop_task and not self.cortex_loop_task.done():
+            tasks_to_cancel.append(self.cortex_loop_task)
         if self.input_listener_task and not self.input_listener_task.done():
             tasks_to_cancel.append(self.input_listener_task)
-
         if self.simulator_task and not self.simulator_task.done():
             tasks_to_cancel.append(self.simulator_task)
-
         if self.action_task and not self.action_task.done():
             tasks_to_cancel.append(self.action_task)
-
         if self.background_task and not self.background_task.done():
             tasks_to_cancel.append(self.background_task)
 
@@ -412,23 +406,16 @@ class ModeCortexRuntime:
         """
         try:
             while True:
-                try:
-                    if (
-                        not self.sleep_ticker_provider.skip_sleep
-                        and self.current_config
-                    ):
-                        await self.sleep_ticker_provider.sleep(
-                            1 / self.current_config.hertz
-                        )
+                if not self.sleep_ticker_provider.skip_sleep and self.current_config:
+                    await self.sleep_ticker_provider.sleep(
+                        1 / self.current_config.hertz
+                    )
 
-                    # Helper to yield control to event loop
-                    await asyncio.sleep(0)
+                # Helper to yield control to event loop
+                await asyncio.sleep(0)
 
-                    await self._tick()
-                    self.sleep_ticker_provider.skip_sleep = False
-                except Exception as e:
-                    logging.error(f"Error in cortex loop: {e}")
-                    await asyncio.sleep(1.0)
+                await self._tick()
+                self.sleep_ticker_provider.skip_sleep = False
         except asyncio.CancelledError:
             logging.info("Cortex loop cancelled, exiting gracefully")
             raise
@@ -539,7 +526,9 @@ class ModeCortexRuntime:
                 current_mtime = self._get_file_mtime()
 
                 if self.last_modified and current_mtime > self.last_modified:
-                    logging.info(f"Config file changed, reloading: {self.config_path}")
+                    logging.info(
+                        f"Runtime config file changed, reloading: {self.config_path}"
+                    )
                     await self._reload_config()
                     self.last_modified = current_mtime
 
@@ -552,10 +541,15 @@ class ModeCortexRuntime:
 
     async def _reload_config(self) -> None:
         """
-        Reload the mode configuration and restart all components.
+        Reload the mode configuration when runtime config file changes.
+
+        The runtime config file serves as a trigger - when it changes, we reload
+        from the original configuration source and then regenerate the runtime config.
         """
         try:
-            logging.info(f"Reloading mode configuration: {self.config_path}")
+            logging.info(
+                f"Runtime config file changed, triggering reload: {self.config_path}"
+            )
 
             self._is_reloading = True
 
@@ -563,11 +557,16 @@ class ModeCortexRuntime:
 
             await self._stop_current_orchestrators()
 
-            logging.info(f"Loading fresh configuration from: {self.mode_config_name}")
-            new_mode_config = load_mode_config(self.mode_config_name)
+            logging.info("Loading configuration from the new runtime file")
+            new_mode_config = load_mode_config(
+                self.mode_config_name,
+                mode_soure_path=self.mode_manager._get_runtime_config_path(),
+            )
 
             self.mode_config = new_mode_config
             self.mode_manager.config = new_mode_config
+
+            self.mode_manager.update_runtime_config()
 
             if current_mode not in new_mode_config.modes:
                 logging.warning(

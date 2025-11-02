@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+import json5
 import zenoh
 
 from runtime.multi_mode.config import (
@@ -14,6 +15,7 @@ from runtime.multi_mode.config import (
     ModeSystemConfig,
     TransitionRule,
     TransitionType,
+    mode_config_to_dict,
 )
 from zenoh_msgs import (
     ModeStatusRequest,
@@ -104,6 +106,56 @@ class ModeManager:
         logging.info(
             f"Mode Manager initialized with current mode: {self.state.current_mode}"
         )
+
+        self._create_runtime_config_file()
+
+    def _get_runtime_config_path(self) -> str:
+        """
+        Get the path to the runtime config file.
+
+        Returns
+        -------
+        str
+            The absolute path to the runtime config file
+        """
+        memory_folder_path = os.path.join(
+            os.path.dirname(__file__), "../../../config", "memory"
+        )
+        if not os.path.exists(memory_folder_path):
+            os.makedirs(memory_folder_path, mode=0o755, exist_ok=True)
+
+        return os.path.join(memory_folder_path, ".runtime.json5")
+
+    def _create_runtime_config_file(self):
+        """
+        Create/update the runtime config file with the current configuration.
+
+        This file is used for hot reload monitoring. When this file changes,
+        the system will reload the configuration.
+        """
+        runtime_config_path = self._get_runtime_config_path()
+
+        try:
+            runtime_config = mode_config_to_dict(self.config)
+
+            temp_file = runtime_config_path + ".tmp"
+            with open(temp_file, "w") as f:
+                json5.dump(runtime_config, f, indent=2)
+
+            os.rename(temp_file, runtime_config_path)
+            logging.debug(f"Runtime config file created/updated: {runtime_config_path}")
+
+        except Exception as e:
+            logging.error(f"Error creating runtime config file: {e}")
+
+    def update_runtime_config(self):
+        """
+        Update the runtime config file with current configuration.
+
+        This should be called whenever the configuration changes
+        to keep the runtime config file in sync.
+        """
+        self._create_runtime_config_file()
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop):
         """
@@ -419,6 +471,9 @@ class ModeManager:
 
             self._save_mode_state()
 
+            # Update runtime config file to reflect the new state
+            self.update_runtime_config()
+
             return True
 
         except Exception as e:
@@ -623,7 +678,7 @@ class ModeManager:
             os.makedirs(memory_folder_path, mode=0o755, exist_ok=True)
 
         config_name = getattr(self.config, "config_name", "default")
-        state_filename = f".{config_name}.json5"
+        state_filename = f".{config_name}.memory.json5"
 
         return os.path.join(memory_folder_path, state_filename)
 

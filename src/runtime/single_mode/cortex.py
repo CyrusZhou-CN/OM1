@@ -3,6 +3,8 @@ import logging
 import os
 from typing import List, Optional, Union
 
+import json5
+
 from actions.orchestrator import ActionOrchestrator
 from backgrounds.orchestrator import BackgroundOrchestrator
 from fuser import Fuser
@@ -80,15 +82,65 @@ class CortexRuntime:
         self._is_reloading = False
 
         if self.hot_reload:
-            self.config_path = os.path.join(
-                os.path.dirname(__file__),
-                "../../../config",
-                self.config_name + ".json5",
-            )
+            self.config_path = self._create_runtime_config_file()
             self.last_modified = self._get_file_mtime()
             logging.info(
-                f"Hot-reload enabled for config: {self.config_name} (check interval: {check_interval}s)"
+                f"Hot-reload enabled for runtime config: {self.config_path} (check interval: {check_interval}s)"
             )
+
+    def _get_runtime_config_path(self) -> str:
+        """
+        Get the path to the runtime config file.
+
+        Returns
+        -------
+        str
+            The absolute path to the runtime config file
+        """
+        memory_folder_path = os.path.join(
+            os.path.dirname(__file__), "../../../config", "memory"
+        )
+        if not os.path.exists(memory_folder_path):
+            os.makedirs(memory_folder_path, mode=0o755, exist_ok=True)
+
+        return os.path.join(memory_folder_path, ".runtime.json5")
+
+    def _create_runtime_config_file(self) -> str:
+        """
+        Create/update the runtime config file with the current configuration.
+
+        This file is used for hot reload monitoring. When this file changes,
+        the system will reload the configuration.
+
+        Returns
+        -------
+        str
+            Path to the runtime configuration file.
+        """
+        runtime_config_path = self._get_runtime_config_path()
+
+        config_path = os.path.join(
+            os.path.dirname(__file__),
+            "../../../config",
+            self.config_name + ".json5",
+        )
+
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    raw = json5.load(f)
+
+                tmp_path = runtime_config_path + ".tmp"
+                with open(tmp_path, "w") as wf:
+                    json5.dump(raw, wf, indent=2)
+                os.replace(tmp_path, runtime_config_path)
+                logging.debug(f"Wrote runtime config to: {runtime_config_path}")
+            else:
+                logging.warning(f"Config not found: {config_path}")
+        except Exception as e:
+            logging.error(f"Failed to create runtime config file: {e}")
+
+        return str(runtime_config_path)
 
     async def run(self) -> None:
         """
@@ -171,13 +223,18 @@ class CortexRuntime:
             try:
                 await asyncio.sleep(self.check_interval)
 
+                if not self.config_path or not os.path.exists(self.config_path):
+                    continue
+
                 current_mtime = self._get_file_mtime()
-                if current_mtime > self.last_modified:
-                    logging.info(f"Config file change detected: {self.config_name}")
+
+                if self.last_modified and current_mtime > self.last_modified:
+                    logging.info(f"Config file changed, reloading: {self.config_path}")
                     await self._reload_config()
                     self.last_modified = current_mtime
 
             except asyncio.CancelledError:
+                logging.debug("Config watcher cancelled")
                 break
             except Exception as e:
                 logging.error(f"Error checking config changes: {e}")
@@ -191,11 +248,13 @@ class CortexRuntime:
             logging.info(f"Reloading configuration: {self.config_name}")
             self._is_reloading = True
 
-            if self.config_name:
-                new_config = load_config(self.config_name)
-            else:
+            if not self.config_name:
                 logging.error("No config name available for reload")
                 return
+
+            new_config = load_config(
+                self.config_name, config_source_path=self.config_path
+            )
 
             await self._stop_current_orchestrators()
 
@@ -223,6 +282,8 @@ class CortexRuntime:
         Stop all current orchestrator tasks gracefully.
         """
         logging.debug("Stopping current orchestrators...")
+
+        self.sleep_ticker_provider.skip_sleep = True
 
         tasks_to_cancel = {}
 
@@ -338,9 +399,11 @@ class CortexRuntime:
         if self.background_task and not self.background_task.done():
             tasks_to_cancel.append(self.background_task)
 
+        # Cancel all tasks
         for task in tasks_to_cancel:
             task.cancel()
 
+        # Wait for cancellations to complete
         if tasks_to_cancel:
             try:
                 await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
@@ -387,10 +450,6 @@ class CortexRuntime:
         """
         try:
             while True:
-                logging.info("--- Cortex Loop Tick ---")
-                logging.info(f"hertz: {self.config.hertz}")
-                logging.info(f"skip_sleep: {self.sleep_ticker_provider.skip_sleep}")
-                logging.info("------------------------")
                 if not self.sleep_ticker_provider.skip_sleep:
                     await self.sleep_ticker_provider.sleep(1 / self.config.hertz)
 
@@ -427,13 +486,13 @@ class CortexRuntime:
         # combine those inputs into a suitable prompt
         prompt = self.fuser.fuse(self.config.agent_inputs, finished_promises)
         if prompt is None:
-            logging.warning("No prompt to fuse")
+            logging.debug("No prompt to fuse")
             return
 
         # if there is a prompt, send to the AIs
         output = await self.config.cortex_llm.ask(prompt)
         if output is None:
-            logging.warning("No output from LLM")
+            logging.debug("No output from LLM")
             return
 
         # Trigger the simulators

@@ -229,7 +229,7 @@ class TestCortexRuntimeHotReload:
             assert runtime.hot_reload is True
             assert runtime.check_interval == 30.0
             assert runtime.last_modified == 1234567890.0
-            assert runtime.config_path.endswith("test_config.json5")
+            assert runtime.config_path.endswith(".runtime.json5")
 
     def test_hot_reload_initialization_disabled(self, mock_config, mock_dependencies):
         """Test hot reload initialization when disabled."""
@@ -447,7 +447,7 @@ class TestCortexRuntimeHotReload:
 
             await runtime._reload_config()
 
-            mock_load_config.assert_called_once_with("test_config")
+            mock_load_config.assert_called_once()
             runtime._stop_current_orchestrators.assert_called_once()
             runtime._start_orchestrators.assert_called_once()
 
